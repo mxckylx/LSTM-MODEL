@@ -386,11 +386,36 @@ if page == "Home":
     main_df = st.session_state.get("main_df")
     if main_df is not None:
         st.markdown("### Preview main dataset")
-        st.dataframe(main_df.head(12), use_container_width=True)
+        st.caption(f"Showing all {len(main_df):,} uploaded rows and {len(main_df.columns)} columns.")
+        st.dataframe(main_df, use_container_width=True, height=420)
 
         columns = list(main_df.columns)
         month_candidates = [c for c in columns if "month" in c.lower() or "date" in c.lower()]
         year_candidates = [c for c in columns if c.lower() == "year" or "year" in c.lower()]
+
+        # Show the year coverage so multi-year files can be checked before preparation.
+        detected_years = None
+        if year_candidates:
+            year_values = numeric_clean(main_df[year_candidates[0]]).dropna().astype(int)
+            if not year_values.empty:
+                detected_years = year_values.value_counts().sort_index()
+        elif month_candidates:
+            parsed_dates = pd.to_datetime(main_df[month_candidates[0]], errors="coerce")
+            date_years = parsed_dates.dt.year.dropna()
+            if not date_years.empty:
+                detected_years = date_years.value_counts().sort_index()
+
+        if detected_years is not None:
+            st.markdown("#### Uploaded year coverage")
+            coverage = pd.DataFrame({
+                "Year": detected_years.index.astype(str),
+                "Rows": detected_years.values
+            })
+            st.dataframe(coverage, hide_index=True, use_container_width=True)
+            st.caption("Check that every expected year (for example, 2024 and 2025) appears before preparing the dataset.")
+        else:
+            st.info("Year coverage will be confirmed after you select the Month and Year columns below.")
+
         target_candidates = [c for c in columns if "kwh" in c.lower() or "consumption" in c.lower()]
 
         c1, c2, c3 = st.columns(3)
@@ -484,13 +509,35 @@ elif page == "Forecast & Evaluation":
     )
     selected_features = []
     if possible_features:
-        select_all = st.checkbox("Select all available numeric predictors", value=False)
+        st.caption("Tick the variables you want the LSTM to use. You can select all, a few, or just one.")
+        select_all_col, clear_col, count_col = st.columns([1, 1, 2])
+
+        # Set checkbox states before creating the checkbox widgets.
+        with select_all_col:
+            if st.button("Select all", use_container_width=True, key="select_all_predictors"):
+                for feature in possible_features:
+                    st.session_state[f"predictor_choice_{feature}"] = True
+        with clear_col:
+            if st.button("Deselect all", use_container_width=True, key="clear_all_predictors"):
+                for feature in possible_features:
+                    st.session_state[f"predictor_choice_{feature}"] = False
+
         feature_cols = st.columns(3)
         for i, feature in enumerate(possible_features):
-            default = select_all
+            state_key = f"predictor_choice_{feature}"
+            if state_key not in st.session_state:
+                st.session_state[state_key] = False
             with feature_cols[i % 3]:
-                if st.checkbox(str(feature), value=default, key=f"predictor_{feature}"):
+                checked = st.checkbox(str(feature), key=state_key)
+                if checked:
                     selected_features.append(feature)
+
+        with count_col:
+            st.metric("Selected variables", f"{len(selected_features)} / {len(possible_features)}")
+        if selected_features:
+            st.caption("Included: " + ", ".join(map(str, selected_features)))
+        else:
+            st.info("No additional predictors selected. The model will use historical kWh only.")
     else:
         st.info("No numeric predictors found. The model will use historical kWh only.")
 
