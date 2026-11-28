@@ -36,7 +36,7 @@ div[data-testid="stMetric"] {background:white;padding:13px;border:1px solid #e5e
 </style>
 """, unsafe_allow_html=True)
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.2"
 MONTH_LOOKUP = {m.lower(): i for i, m in enumerate(month_name) if m}
 MONTH_LOOKUP.update({m[:3].lower(): i for i, m in enumerate(month_name) if m})
 
@@ -48,15 +48,65 @@ def clean_columns(df):
     return out
 
 
-def read_file(file):
-    if file is None:
+def read_files(files):
+    """Read one or more CSV/Excel files and combine every Excel worksheet.
+
+    If a worksheet or filename is a four-digit year (e.g. 2024.xlsx or
+    a sheet named 2025), that year is attached to month-name-only records.
+    """
+    if not files:
         return None
-    name = file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(file)
-    if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(file)
-    raise ValueError("Upload a CSV or Excel file.")
+
+    if not isinstance(files, (list, tuple)):
+        files = [files]
+
+    frames = []
+    for uploaded in files:
+        filename = uploaded.name
+        lower_name = filename.lower()
+        filename_year_match = re.search(r"(?<!\\d)(19\\d{2}|20\\d{2}|21\\d{2})(?!\\d)", filename)
+        filename_year = int(filename_year_match.group(1)) if filename_year_match else None
+
+        if lower_name.endswith(".csv"):
+            frame = pd.read_csv(uploaded)
+            frame["_Source_File"] = filename
+            if filename_year is not None and not any("year" in str(c).lower() for c in frame.columns):
+                frame["Year"] = filename_year
+            frames.append(frame)
+        elif lower_name.endswith((".xlsx", ".xls")):
+            # sheet_name=None reads ALL worksheets, not only the first one.
+            sheets = pd.read_excel(uploaded, sheet_name=None)
+            for sheet_name, sheet_df in sheets.items():
+                if sheet_df.empty:
+                    continue
+                frame = sheet_df.copy()
+                has_year = any("year" in str(c).lower() for c in frame.columns)
+                sheet_year_match = re.fullmatch(r"(19\\d{2}|20\\d{2}|21\\d{2})", str(sheet_name).strip())
+                sheet_year = int(sheet_year_match.group(1)) if sheet_year_match else None
+
+                if not has_year:
+                    inferred_year = sheet_year if sheet_year is not None else filename_year
+                    if inferred_year is not None:
+                        frame["Year"] = inferred_year
+
+                frame["_Source_File"] = filename
+                frame["_Source_Sheet"] = str(sheet_name)
+                frames.append(frame)
+        else:
+            raise ValueError(f"Unsupported file type: {filename}. Upload CSV or Excel files.")
+
+    if not frames:
+        raise ValueError("No readable rows were found in the uploaded file(s).")
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    combined.columns = [str(c).strip() for c in combined.columns]
+
+    # Excel exports sometimes contain merged Year cells; carry the year down.
+    year_cols = [c for c in combined.columns if "year" in str(c).lower()]
+    for col in year_cols:
+        combined[col] = combined[col].replace(r"^\\s*$", np.nan, regex=True).ffill()
+
+    return combined
 
 
 def numeric_clean(series):
@@ -351,34 +401,42 @@ if page == "Home":
     left, right = st.columns(2)
     with left:
         st.markdown("### 1. Main dataset")
-        main_file = st.file_uploader(
-            "Upload CSV or Excel file",
+        main_files = st.file_uploader(
+            "Upload one or more CSV/Excel files",
             type=["csv", "xlsx", "xls"],
+            accept_multiple_files=True,
             key="main_upload",
-            help="Required: month/date, kWh consumption, and any other columns you want to keep in the same file.",
+            help="You may upload multiple yearly files. Every worksheet in each Excel file will also be read.",
         )
     with right:
         st.markdown("### 2. Additional variables (optional)")
-        extra_file = st.file_uploader(
-            "Upload a second CSV or Excel file",
+        extra_files = st.file_uploader(
+            "Upload one or more additional-variable files",
             type=["csv", "xlsx", "xls"],
+            accept_multiple_files=True,
             key="extra_upload",
-            help="Optional. If uploaded, include Month and optionally Year so rows can be matched by month.",
+            help="Optional. You may upload multiple yearly files. Include Month and Year, or use year-named files/sheets.",
         )
 
-    if main_file:
+    if main_files:
         try:
-            main_df = clean_columns(read_file(main_file))
+            main_df = clean_columns(read_files(main_files))
             st.session_state.main_df = main_df
-            st.success(f"Main dataset loaded: {len(main_df)} rows and {len(main_df.columns)} columns.")
+            st.success(
+                f"Main dataset loaded: {len(main_df):,} rows, "
+                f"{len(main_df.columns)} columns, from {len(main_files)} file(s) and all readable worksheets."
+            )
         except Exception as exc:
             st.error(f"Could not read the main dataset: {exc}")
             st.session_state.main_df = None
 
-    if extra_file:
+    if extra_files:
         try:
-            st.session_state.extra_df = clean_columns(read_file(extra_file))
-            st.success(f"Additional dataset loaded: {len(st.session_state.extra_df)} rows.")
+            st.session_state.extra_df = clean_columns(read_files(extra_files))
+            st.success(
+                f"Additional dataset loaded: {len(st.session_state.extra_df):,} rows "
+                f"from {len(extra_files)} file(s) and all readable worksheets."
+            )
         except Exception as exc:
             st.error(f"Could not read the additional dataset: {exc}")
             st.session_state.extra_df = None
@@ -386,36 +444,17 @@ if page == "Home":
     main_df = st.session_state.get("main_df")
     if main_df is not None:
         st.markdown("### Preview main dataset")
-        st.caption(f"Showing all {len(main_df):,} uploaded rows and {len(main_df.columns)} columns.")
+        st.caption(
+            f"Showing all {len(main_df):,} uploaded rows and {len(main_df.columns)} columns. "
+            "Scroll inside the table to inspect later years."
+        )
         st.dataframe(main_df, use_container_width=True, height=420)
 
         columns = list(main_df.columns)
         month_candidates = [c for c in columns if "month" in c.lower() or "date" in c.lower()]
         year_candidates = [c for c in columns if c.lower() == "year" or "year" in c.lower()]
 
-        # Show the year coverage so multi-year files can be checked before preparation.
-        detected_years = None
-        if year_candidates:
-            year_values = numeric_clean(main_df[year_candidates[0]]).dropna().astype(int)
-            if not year_values.empty:
-                detected_years = year_values.value_counts().sort_index()
-        elif month_candidates:
-            parsed_dates = pd.to_datetime(main_df[month_candidates[0]], errors="coerce")
-            date_years = parsed_dates.dt.year.dropna()
-            if not date_years.empty:
-                detected_years = date_years.value_counts().sort_index()
-
-        if detected_years is not None:
-            st.markdown("#### Uploaded year coverage")
-            coverage = pd.DataFrame({
-                "Year": detected_years.index.astype(str),
-                "Rows": detected_years.values
-            })
-            st.dataframe(coverage, hide_index=True, use_container_width=True)
-            st.caption("Check that every expected year (for example, 2024 and 2025) appears before preparing the dataset.")
-        else:
-            st.info("Year coverage will be confirmed after you select the Month and Year columns below.")
-
+        # Year coverage is calculated after the user selects the actual date/year columns.
         target_candidates = [c for c in columns if "kwh" in c.lower() or "consumption" in c.lower()]
 
         c1, c2, c3 = st.columns(3)
@@ -433,12 +472,31 @@ if page == "Home":
             target_col = st.selectbox("Electricity consumption (kWh)", columns,
                                       index=columns.index(target_default))
 
+        try:
+            selected_periods = parse_months(main_df, month_col, year_col)
+            year_counts = pd.Series(selected_periods.year).value_counts().sort_index()
+            coverage = pd.DataFrame({
+                "Year": year_counts.index.astype(int),
+                "Monthly records": year_counts.values,
+            })
+            st.markdown("#### Main dataset year coverage")
+            st.dataframe(coverage, hide_index=True, use_container_width=True)
+            st.caption(
+                f"Detected coverage: {selected_periods.min()} to {selected_periods.max()} "
+                f"({len(selected_periods):,} records across {year_counts.size} year(s))."
+            )
+        except Exception as date_error:
+            st.warning(f"Year coverage cannot be confirmed yet: {date_error}")
+
         extra_df = st.session_state.get("extra_df")
         extra_month_col = None
         extra_year_col = None
         if extra_df is not None:
             st.markdown("### Preview additional variables")
-            st.dataframe(extra_df.head(8), use_container_width=True)
+            st.caption(
+                f"Showing all {len(extra_df):,} uploaded rows and {len(extra_df.columns)} columns."
+            )
+            st.dataframe(extra_df, use_container_width=True, height=420)
             extra_cols = list(extra_df.columns)
             extra_month_candidates = [c for c in extra_cols if "month" in c.lower() or "date" in c.lower()]
             extra_year_candidates = [c for c in extra_cols if "year" in c.lower()]
@@ -453,8 +511,26 @@ if page == "Home":
                     ey_choice = st.selectbox("Additional file Year column", ey_options,
                                              index=ey_options.index(ey_default))
                     extra_year_col = None if ey_choice == "None" else ey_choice
+                try:
+                    extra_periods = parse_months(extra_df, extra_month_col, extra_year_col)
+                    extra_year_counts = pd.Series(extra_periods.year).value_counts().sort_index()
+                    extra_coverage = pd.DataFrame({
+                        "Year": extra_year_counts.index.astype(int),
+                        "Monthly records": extra_year_counts.values,
+                    })
+                    st.markdown("#### Additional variables year coverage")
+                    st.dataframe(extra_coverage, hide_index=True, use_container_width=True)
+                    st.caption(
+                        f"Detected additional-data coverage: {extra_periods.min()} to {extra_periods.max()} "
+                        f"({len(extra_periods):,} records across {extra_year_counts.size} year(s))."
+                    )
+                except Exception as date_error:
+                    st.warning(f"Additional-data year coverage cannot be confirmed yet: {date_error}")
             else:
-                st.warning("No Month/date column found in the additional file. Rows will be matched by row order.")
+                st.warning(
+                    "No Month/date column found in Additional Variables. "
+                    "Rows will be matched by row order, so confirm that both files are aligned exactly."
+                )
 
         if st.button("Validate and Prepare Dataset", type="primary", use_container_width=True):
             try:
@@ -497,7 +573,7 @@ elif page == "Forecast & Evaluation":
 
     possible_features = [
         c for c in data.columns
-        if c not in ["Month", "Consumption_kWh"]
+        if c not in ["Month", "Consumption_kWh", "_Source_File", "_Source_Sheet"]
         and pd.api.types.is_numeric_dtype(numeric_clean(data[c]))
         and numeric_clean(data[c]).notna().any()
     ]
@@ -672,7 +748,9 @@ elif page == "How to Use":
     - Diesel consumption
     - Peak demand (kW), if available
 
-    The app accepts CSV, XLSX, and XLS files. A separate additional-variables file is optional.
+    The app accepts one or multiple CSV, XLSX, and XLS files. Every worksheet in each Excel workbook is read.
+    If a file is named `2024.xlsx` or a worksheet is named `2025`, that year can be inferred for month-name-only rows.
+    For other layouts, provide explicit Month and Year columns. There is no hard-coded maximum year.
 
     ### Important preparation checks
     1. Use one record per month.
